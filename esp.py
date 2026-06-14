@@ -6,13 +6,15 @@ Fully external: scans GUObjectArray, walks objects, renders overlay.
 import sys
 import struct
 import math
+import ctypes
 from dataclasses import dataclass
 from typing import Tuple
 
 import pymem
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QCheckBox, QComboBox, QLabel,
-    QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QColorDialog
+    QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QColorDialog,
+    QSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont
@@ -293,7 +295,13 @@ class MecchaESP:
         fov = rfloat(self.pm, pov + OFFSETS["FMinimalViewInfo::FOV"])
         return {"loc": loc, "rot": rot, "fov": fov}
 
-    def iter_players(self, include_local=False):
+    def _class_name(self, obj):
+        if not obj:
+            return ""
+        cls = rp(self.pm, obj + OFFSETS["UObjectBase::ClassPrivate"])
+        return self.objects._obj_name(cls) if cls else ""
+
+    def iter_players(self, include_local=False, team_filter=False):
         world = self._get_world()
         if not world:
             return
@@ -303,6 +311,7 @@ class MecchaESP:
         pc = self._get_local_controller(world)
         local_pawn = rp(self.pm, pc + OFFSETS["APlayerController::AcknowledgedPawn"]) if pc else 0
         local_ps = rp(self.pm, pc + OFFSETS["AController::PlayerState"]) if pc else 0
+        local_pawn_cls = self._class_name(local_pawn)
 
         if include_local and local_pawn:
             root = rp(self.pm, local_pawn + OFFSETS["AActor::RootComponent"])
@@ -320,6 +329,14 @@ class MecchaESP:
             pawn = rp(self.pm, ps + OFFSETS["APlayerState::PawnPrivate"])
             if not pawn or pawn == local_pawn:
                 continue
+            pawn_cls = self._class_name(pawn)
+            if not pawn_cls:
+                continue
+            if team_filter and local_pawn_cls:
+                if pawn_cls == local_pawn_cls:
+                    continue
+                if "Spectate" in pawn_cls:
+                    continue
             root = rp(self.pm, pawn + OFFSETS["AActor::RootComponent"])
             if not root:
                 continue
@@ -388,8 +405,10 @@ class Config:
     snap_lines: bool = True
     enemy_color: Tuple[int, int, int] = (255, 0, 0)
     local_color: Tuple[int, int, int] = (0, 255, 0)
-    box_height_world: float = 170.0
+    box_height_world: float = 100.0
     box_width_ratio: float = 0.45
+    box_y_offset: int = 0
+    team_filter: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +424,7 @@ class Menu(QWidget):
         self._drag_pos = None
 
         self._build_ui()
-        self.setFixedSize(260, 360)
+        self.setFixedSize(260, 440)
 
     def _build_ui(self):
         container = QFrame(self)
@@ -460,12 +479,14 @@ class Menu(QWidget):
         self.cb_names = self._chk("Show Names", "show_names")
         self.cb_dist = self._chk("Show Distance", "show_distance")
         self.cb_snap = self._chk("Snap Lines", "snap_lines")
+        self.cb_team = self._chk("Team Filter (Hunters)", "team_filter")
         layout.addWidget(self.cb_enabled)
         layout.addWidget(self.cb_box)
         layout.addWidget(self.cb_local)
         layout.addWidget(self.cb_names)
         layout.addWidget(self.cb_dist)
         layout.addWidget(self.cb_snap)
+        layout.addWidget(self.cb_team)
 
         box_row = QHBoxLayout()
         box_row.addWidget(QLabel("Box Style:"))
@@ -484,6 +505,24 @@ class Menu(QWidget):
         color_row.addWidget(self.btn_enemy_color)
         color_row.addWidget(self.btn_local_color)
         layout.addLayout(color_row)
+
+        height_row = QHBoxLayout()
+        height_row.addWidget(QLabel("Box Height:"))
+        self.spn_height = QSpinBox()
+        self.spn_height.setRange(50, 250)
+        self.spn_height.setValue(int(self.config.box_height_world))
+        self.spn_height.valueChanged.connect(lambda v: setattr(self.config, "box_height_world", float(v)))
+        height_row.addWidget(self.spn_height)
+        layout.addLayout(height_row)
+
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Y Offset:"))
+        self.spn_yoff = QSpinBox()
+        self.spn_yoff.setRange(-50, 50)
+        self.spn_yoff.setValue(self.config.box_y_offset)
+        self.spn_yoff.valueChanged.connect(lambda v: setattr(self.config, "box_y_offset", v))
+        offset_row.addWidget(self.spn_yoff)
+        layout.addLayout(offset_row)
 
         hint = QLabel("Insert / F1 to toggle menu")
         hint.setStyleSheet("color: #888; font-size: 10px;")
@@ -598,7 +637,7 @@ class Overlay(QWidget):
             return
 
         count = 0
-        for is_local, pos, idx in self.esp.iter_players(include_local=self.config.show_local):
+        for is_local, pos, idx in self.esp.iter_players(include_local=self.config.show_local, team_filter=self.config.team_filter):
             screen_info = self._project_box(pos, cam, w, h)
             if not screen_info:
                 continue
@@ -638,7 +677,7 @@ class Overlay(QWidget):
         box_h = abs(s_feet[1] - s_head[1])
         box_w = box_h * self.config.box_width_ratio
         cx = s_feet[0]
-        cy = (s_feet[1] + s_head[1]) / 2
+        cy = (s_feet[1] + s_head[1]) / 2 + self.config.box_y_offset
         return (cx, cy, box_w, box_h)
 
     def _draw_box(self, painter, cx, cy, bw, bh, color):
@@ -669,7 +708,18 @@ class Overlay(QWidget):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _set_dpi_aware():
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)  # PerMonitorAwareV2
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main():
+    _set_dpi_aware()
     app = QApplication(sys.argv)
     config = Config()
     esp = MecchaESP()
@@ -679,7 +729,6 @@ def main():
     menu.show()
 
     # Poll Insert/F1 globally to toggle menu visibility.
-    import ctypes
     VK_INSERT = 0x2D
     VK_F1 = 0x70
     _key_states = {"insert": False, "f1": False}
