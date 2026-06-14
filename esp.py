@@ -21,38 +21,81 @@ from PyQt5.QtGui import QPainter, QPen, QColor, QFont
 
 
 # ---------------------------------------------------------------------------
-# Offsets from CXXHeaderDump / UE4SS Live View
+# Bootstrap offsets: stable UObject/UStruct/FField layout used to resolve
+# everything else dynamically at runtime.
 # ---------------------------------------------------------------------------
 OFFSETS = {
     "UObjectBase::ClassPrivate": 0x10,
     "UObjectBase::NamePrivate": 0x18,
+    "UObjectBase::OuterPrivate": 0x20,
 
-    "UWorld::GameState": 0x1B0,
-    "UWorld::OwningGameInstance": 0x228,
+    "UStruct::SuperStruct": 0x40,
+    "UStruct::ChildProperties": 0x50,
 
-    "UGameInstance::LocalPlayers": 0x38,
-    "UPlayer::PlayerController": 0x30,
+    "FField::Next": 0x18,
+    "FField::NamePrivate": 0x20,
+    "FProperty::Offset_Internal": 0x44,
 
-    "UEngine::GameViewport": 0xC10,
-    "UGameViewportClient::World": 0x78,
-
-    "AGameStateBase::PlayerArray": 0x2C0,
-    "APlayerState::PawnPrivate": 0x320,
-
-    "AController::PlayerState": 0x2B0,
-    "APlayerController::AcknowledgedPawn": 0x350,
-    "APlayerController::PlayerCameraManager": 0x360,
-
-    "APlayerCameraManager::CameraCachePrivate": 0x1530,
-
+    # Nested struct layouts are extremely stable; keep as fallback.
     "FCameraCacheEntry::POV": 0x10,
     "FMinimalViewInfo::Location": 0x0,
     "FMinimalViewInfo::Rotation": 0x18,
     "FMinimalViewInfo::FOV": 0x30,
-
-    "AActor::RootComponent": 0x1B8,
-    "USceneComponent::RelativeLocation": 0x140,
 }
+
+
+# ---------------------------------------------------------------------------
+# Dynamic offset resolver: walks class FField property chains.
+# ---------------------------------------------------------------------------
+class OffsetResolver:
+    """Resolves engine class property offsets by walking ChildProperties."""
+
+    def __init__(self, pm, objects):
+        self.pm = pm
+        self.objects = objects
+        self.cache = dict(OFFSETS)
+
+    def _field_name(self, field):
+        return self.objects.fnames.resolve(ru32(self.pm, field + self.cache["FField::NamePrivate"]))
+
+    def _resolve_on_class(self, cls, prop_name):
+        prop = rp(self.pm, cls + self.cache["UStruct::ChildProperties"])
+        depth = 0
+        while prop and depth < 512:
+            name = self._field_name(prop)
+            if name == prop_name:
+                return ru32(self.pm, prop + self.cache["FProperty::Offset_Internal"])
+            prop = rp(self.pm, prop + self.cache["FField::Next"])
+            depth += 1
+        return None
+
+    def resolve(self, class_name, prop_name):
+        key = f"{class_name}::{prop_name}"
+        if key in self.cache:
+            return self.cache[key]
+        cls = self.objects.find_class(class_name)
+        if not cls:
+            return None
+        offset = self._resolve_on_class(cls, prop_name)
+        seen = {cls}
+        while offset is None:
+            super_cls = rp(self.pm, cls + self.cache["UStruct::SuperStruct"])
+            if not super_cls or super_cls in seen:
+                break
+            seen.add(super_cls)
+            offset = self._resolve_on_class(super_cls, prop_name)
+        if offset is not None:
+            self.cache[key] = offset
+        return offset
+
+    def resolve_map(self, mapping):
+        out = {}
+        for key, (cls, prop) in mapping.items():
+            val = self.resolve(cls, prop)
+            if val is None:
+                raise RuntimeError(f"Could not resolve offset {key} ({cls}.{prop})")
+            out[key] = val
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +282,23 @@ class MecchaESP:
     GUOBJECT_MASK = bytes([1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1])
     FNAMEPOOL_DELTA = 0xE3B40
 
+    OFFSET_MAP = {
+        "UWorld::GameState": ("World", "GameState"),
+        "UWorld::OwningGameInstance": ("World", "OwningGameInstance"),
+        "UGameInstance::LocalPlayers": ("GameInstance", "LocalPlayers"),
+        "UPlayer::PlayerController": ("Player", "PlayerController"),
+        "UEngine::GameViewport": ("Engine", "GameViewport"),
+        "UGameViewportClient::World": ("GameViewportClient", "World"),
+        "AGameStateBase::PlayerArray": ("GameStateBase", "PlayerArray"),
+        "APlayerState::PawnPrivate": ("PlayerState", "PawnPrivate"),
+        "AController::PlayerState": ("Controller", "PlayerState"),
+        "APlayerController::AcknowledgedPawn": ("PlayerController", "AcknowledgedPawn"),
+        "APlayerController::PlayerCameraManager": ("PlayerController", "PlayerCameraManager"),
+        "APlayerCameraManager::CameraCachePrivate": ("PlayerCameraManager", "CameraCachePrivate"),
+        "AActor::RootComponent": ("Actor", "RootComponent"),
+        "USceneComponent::RelativeLocation": ("SceneComponent", "RelativeLocation"),
+    }
+
     def __init__(self):
         self.pm = pymem.Pymem(self.PROCESS_NAME)
         self.guobject_array = self._scan_guobject_array()
@@ -246,6 +306,12 @@ class MecchaESP:
             raise RuntimeError("Could not find GUObjectArray via pattern scan")
         self.fname_pool = self.guobject_array - self.FNAMEPOOL_DELTA
         self.objects = UObjectArray(self.pm, self.guobject_array, self.fname_pool)
+        self.resolver = OffsetResolver(self.pm, self.objects)
+        self.offsets = self.resolver.resolve_map(self.OFFSET_MAP)
+        # Fill in the stable nested struct offsets from the bootstrap dict.
+        for key in ("FCameraCacheEntry::POV", "FMinimalViewInfo::Location",
+                    "FMinimalViewInfo::Rotation", "FMinimalViewInfo::FOV"):
+            self.offsets[key] = OFFSETS[key]
         self.gengine = self.objects.find_first_instance("GameEngine")
         if not self.gengine:
             raise RuntimeError("Could not find GEngine instance")
@@ -259,24 +325,24 @@ class MecchaESP:
         return addr + 7 + rel
 
     def _get_world(self):
-        viewport = rp(self.pm, self.gengine + OFFSETS["UEngine::GameViewport"])
+        viewport = rp(self.pm, self.gengine + self.offsets["UEngine::GameViewport"])
         if not viewport:
             return 0
-        return rp(self.pm, viewport + OFFSETS["UGameViewportClient::World"])
+        return rp(self.pm, viewport + self.offsets["UGameViewportClient::World"])
 
     def _get_local_controller(self, world):
         if not world:
             return 0
-        gi = rp(self.pm, world + OFFSETS["UWorld::OwningGameInstance"])
+        gi = rp(self.pm, world + self.offsets["UWorld::OwningGameInstance"])
         if not gi:
             return 0
-        lp_data, lp_count, _ = read_array(self.pm, gi + OFFSETS["UGameInstance::LocalPlayers"])
+        lp_data, lp_count, _ = read_array(self.pm, gi + self.offsets["UGameInstance::LocalPlayers"])
         if not lp_data or lp_count == 0:
             return 0
         local_player = rp(self.pm, lp_data)
         if not local_player:
             return 0
-        return rp(self.pm, local_player + OFFSETS["UPlayer::PlayerController"])
+        return rp(self.pm, local_player + self.offsets["UPlayer::PlayerController"])
 
     def get_camera(self):
         world = self._get_world()
@@ -285,14 +351,14 @@ class MecchaESP:
         pc = self._get_local_controller(world)
         if not pc:
             return None
-        cam = rp(self.pm, pc + OFFSETS["APlayerController::PlayerCameraManager"])
+        cam = rp(self.pm, pc + self.offsets["APlayerController::PlayerCameraManager"])
         if not cam:
             return None
-        cc = cam + OFFSETS["APlayerCameraManager::CameraCachePrivate"]
-        pov = cc + OFFSETS["FCameraCacheEntry::POV"]
-        loc = rvec3(self.pm, pov + OFFSETS["FMinimalViewInfo::Location"])
-        rot = rvec3(self.pm, pov + OFFSETS["FMinimalViewInfo::Rotation"])
-        fov = rfloat(self.pm, pov + OFFSETS["FMinimalViewInfo::FOV"])
+        cc = cam + self.offsets["APlayerCameraManager::CameraCachePrivate"]
+        pov = cc + self.offsets["FCameraCacheEntry::POV"]
+        loc = rvec3(self.pm, pov + self.offsets["FMinimalViewInfo::Location"])
+        rot = rvec3(self.pm, pov + self.offsets["FMinimalViewInfo::Rotation"])
+        fov = rfloat(self.pm, pov + self.offsets["FMinimalViewInfo::FOV"])
         return {"loc": loc, "rot": rot, "fov": fov}
 
     def _class_name(self, obj):
@@ -305,28 +371,28 @@ class MecchaESP:
         world = self._get_world()
         if not world:
             return
-        gamestate = rp(self.pm, world + OFFSETS["UWorld::GameState"])
+        gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
         if not gamestate:
             return
         pc = self._get_local_controller(world)
-        local_pawn = rp(self.pm, pc + OFFSETS["APlayerController::AcknowledgedPawn"]) if pc else 0
-        local_ps = rp(self.pm, pc + OFFSETS["AController::PlayerState"]) if pc else 0
+        local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
+        local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
         local_pawn_cls = self._class_name(local_pawn)
 
         if include_local and local_pawn:
-            root = rp(self.pm, local_pawn + OFFSETS["AActor::RootComponent"])
+            root = rp(self.pm, local_pawn + self.offsets["AActor::RootComponent"])
             if root:
-                pos = rvec3(self.pm, root + OFFSETS["USceneComponent::RelativeLocation"])
+                pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
                 yield True, pos, 0
 
-        pa_data, pa_count, _ = read_array(self.pm, gamestate + OFFSETS["AGameStateBase::PlayerArray"])
+        pa_data, pa_count, _ = read_array(self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"])
         if not pa_data or pa_count == 0:
             return
         for i in range(pa_count):
             ps = rp(self.pm, pa_data + i * 8)
             if not ps or ps == local_ps:
                 continue
-            pawn = rp(self.pm, ps + OFFSETS["APlayerState::PawnPrivate"])
+            pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
             if not pawn or pawn == local_pawn:
                 continue
             pawn_cls = self._class_name(pawn)
@@ -337,10 +403,10 @@ class MecchaESP:
                     continue
                 if "Spectate" in pawn_cls:
                     continue
-            root = rp(self.pm, pawn + OFFSETS["AActor::RootComponent"])
+            root = rp(self.pm, pawn + self.offsets["AActor::RootComponent"])
             if not root:
                 continue
-            pos = rvec3(self.pm, root + OFFSETS["USceneComponent::RelativeLocation"])
+            pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
             yield False, pos, i
 
 

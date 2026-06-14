@@ -13,22 +13,23 @@ ULevelActorContainer_Actors = 0x28
 
 
 def actor_pos(esp, actor):
-    root = rp(esp.pm, actor + OFFSETS["AActor::RootComponent"])
+    root = rp(esp.pm, actor + esp.offsets["AActor::RootComponent"])
     if root:
-        return rvec3(esp.pm, root + OFFSETS["USceneComponent::RelativeLocation"])
+        return rvec3(esp.pm, root + esp.offsets["USceneComponent::RelativeLocation"])
     return (0.0, 0.0, 0.0)
 
 
 esp = MecchaESP()
+off = esp.offsets
 world = esp._get_world()
 pc = esp._get_local_controller(world)
-local_ps = rp(esp.pm, pc + OFFSETS["AController::PlayerState"]) if pc else 0
-local_pawn = rp(esp.pm, pc + OFFSETS["APlayerController::AcknowledgedPawn"]) if pc else 0
+local_ps = rp(esp.pm, pc + off["AController::PlayerState"]) if pc else 0
+local_pawn = rp(esp.pm, pc + off["APlayerController::AcknowledgedPawn"]) if pc else 0
 
-gamestate = rp(esp.pm, world + OFFSETS["UWorld::GameState"])
+gamestate = rp(esp.pm, world + off["UWorld::GameState"])
 gs_cls = rp(esp.pm, gamestate + OFFSETS["UObjectBase::ClassPrivate"]) if gamestate else 0
 gs_cls_name = esp.objects._obj_name(gs_cls) if gs_cls else "?"
-pa_data, pa_count, _ = read_array(esp.pm, gamestate + OFFSETS["AGameStateBase::PlayerArray"])
+pa_data, pa_count, _ = read_array(esp.pm, gamestate + off["AGameStateBase::PlayerArray"])
 
 pc_cls = rp(esp.pm, pc + OFFSETS["UObjectBase::ClassPrivate"]) if pc else 0
 pc_cls_name = esp.objects._obj_name(pc_cls) if pc_cls else "?"
@@ -51,7 +52,7 @@ for i in range(pa_count):
     cls = rp(esp.pm, ps + OFFSETS["UObjectBase::ClassPrivate"])
     cls_name = esp.objects._obj_name(cls) if cls else "?"
     name = esp.objects._obj_name(ps) or "?"
-    pawn = rp(esp.pm, ps + OFFSETS["APlayerState::PawnPrivate"])
+    pawn = rp(esp.pm, ps + off["APlayerState::PawnPrivate"])
     pawn_cls = rp(esp.pm, pawn + OFFSETS["UObjectBase::ClassPrivate"]) if pawn else 0
     pawn_cls_name = esp.objects._obj_name(pawn_cls) if pawn_cls else "?"
     pos = actor_pos(esp, pawn) if pawn else (0, 0, 0)
