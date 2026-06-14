@@ -37,6 +37,7 @@ OFFSETS = {
     "AGameStateBase::PlayerArray": 0x2C0,
     "APlayerState::PawnPrivate": 0x320,
 
+    "AController::PlayerState": 0x2B0,
     "APlayerController::AcknowledgedPawn": 0x350,
     "APlayerController::PlayerCameraManager": 0x360,
 
@@ -301,6 +302,7 @@ class MecchaESP:
             return
         pc = self._get_local_controller(world)
         local_pawn = rp(self.pm, pc + OFFSETS["APlayerController::AcknowledgedPawn"]) if pc else 0
+        local_ps = rp(self.pm, pc + OFFSETS["AController::PlayerState"]) if pc else 0
 
         if include_local and local_pawn:
             root = rp(self.pm, local_pawn + OFFSETS["AActor::RootComponent"])
@@ -313,7 +315,7 @@ class MecchaESP:
             return
         for i in range(pa_count):
             ps = rp(self.pm, pa_data + i * 8)
-            if not ps:
+            if not ps or ps == local_ps:
                 continue
             pawn = rp(self.pm, ps + OFFSETS["APlayerState::PawnPrivate"])
             if not pawn or pawn == local_pawn:
