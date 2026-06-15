@@ -12,9 +12,9 @@ from typing import Tuple
 
 import pymem
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QCheckBox, QLabel,
+    QApplication, QWidget, QCheckBox, QComboBox, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QColorDialog,
-    QSpinBox
+    QSpinBox, QDoubleSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont
@@ -635,10 +635,18 @@ class Config:
     snap_lines: bool = True
     enemy_color: Tuple[int, int, int] = (255, 0, 0)
     local_color: Tuple[int, int, int] = (0, 255, 0)
-    box_height_world: float = 100.0  # still used to find the model center
+    box_height_world: float = 100.0
     box_y_offset: int = 0
     dot_radius: int = 8
     team_filter: bool = True
+
+    # Aimbot
+    aimbot_enabled: bool = False
+    aimbot_key: str = "MB5"
+    aimbot_fov: int = 150
+    aimbot_smooth: float = 0.30
+    aimbot_target_offset: float = 90.0  # cm above capsule center (head)
+    aimbot_show_fov: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +662,7 @@ class Menu(QWidget):
         self._drag_pos = None
 
         self._build_ui()
-        self.setFixedSize(260, 440)
+        self.setFixedSize(260, 620)
 
     def _build_ui(self):
         container = QFrame(self)
@@ -676,6 +684,12 @@ class Menu(QWidget):
             QCheckBox::indicator {
                 width: 16px;
                 height: 16px;
+            }
+            QComboBox {
+                background-color: #333;
+                color: #eee;
+                border: 1px solid #555;
+                padding: 4px;
             }
             QPushButton {
                 background-color: #333;
@@ -720,6 +734,52 @@ class Menu(QWidget):
         self.spn_dot.valueChanged.connect(lambda v: setattr(self.config, "dot_radius", v))
         dot_row.addWidget(self.spn_dot)
         layout.addLayout(dot_row)
+
+        aim_title = QLabel("AIMBOT")
+        aim_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #f0f;")
+        layout.addWidget(aim_title)
+
+        self.cb_aimbot = self._chk("Aimbot Enabled", "aimbot_enabled")
+        self.cb_aim_fov = self._chk("Show FOV Circle", "aimbot_show_fov")
+        layout.addWidget(self.cb_aimbot)
+        layout.addWidget(self.cb_aim_fov)
+
+        aim_key_row = QHBoxLayout()
+        aim_key_row.addWidget(QLabel("Aim Key:"))
+        self.cmb_aim_key = QComboBox()
+        self.cmb_aim_key.addItems(["MB4", "MB5", "Shift", "Ctrl", "Alt", "RMB", "MMB"])
+        self.cmb_aim_key.setCurrentText(self.config.aimbot_key)
+        self.cmb_aim_key.currentTextChanged.connect(lambda t: setattr(self.config, "aimbot_key", t))
+        aim_key_row.addWidget(self.cmb_aim_key)
+        layout.addLayout(aim_key_row)
+
+        fov_row = QHBoxLayout()
+        fov_row.addWidget(QLabel("FOV Radius:"))
+        self.spn_aim_fov = QSpinBox()
+        self.spn_aim_fov.setRange(10, 600)
+        self.spn_aim_fov.setValue(self.config.aimbot_fov)
+        self.spn_aim_fov.valueChanged.connect(lambda v: setattr(self.config, "aimbot_fov", v))
+        fov_row.addWidget(self.spn_aim_fov)
+        layout.addLayout(fov_row)
+
+        smooth_row = QHBoxLayout()
+        smooth_row.addWidget(QLabel("Smooth:"))
+        self.spn_aim_smooth = QDoubleSpinBox()
+        self.spn_aim_smooth.setRange(0.01, 1.0)
+        self.spn_aim_smooth.setSingleStep(0.05)
+        self.spn_aim_smooth.setValue(self.config.aimbot_smooth)
+        self.spn_aim_smooth.valueChanged.connect(lambda v: setattr(self.config, "aimbot_smooth", v))
+        smooth_row.addWidget(self.spn_aim_smooth)
+        layout.addLayout(smooth_row)
+
+        aim_off_row = QHBoxLayout()
+        aim_off_row.addWidget(QLabel("Target Offset:"))
+        self.spn_aim_off = QSpinBox()
+        self.spn_aim_off.setRange(-200, 200)
+        self.spn_aim_off.setValue(int(self.config.aimbot_target_offset))
+        self.spn_aim_off.valueChanged.connect(lambda v: setattr(self.config, "aimbot_target_offset", float(v)))
+        aim_off_row.addWidget(self.spn_aim_off)
+        layout.addLayout(aim_off_row)
 
         color_row = QHBoxLayout()
         self.btn_enemy_color = QPushButton("Enemy Color")
@@ -888,6 +948,24 @@ class Overlay(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(10, 20, f"Players: {count}")
 
+        # ------------------------------------------------------------------
+        # Aimbot
+        # ------------------------------------------------------------------
+        if self.config.aimbot_enabled:
+            cx, cy = w / 2, h / 2
+            if self.config.aimbot_show_fov:
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(int(cx - self.config.aimbot_fov),
+                                    int(cy - self.config.aimbot_fov),
+                                    self.config.aimbot_fov * 2,
+                                    self.config.aimbot_fov * 2)
+
+            best_target = self._find_best_target(cam, w, h)
+            if best_target and self._aim_key_held():
+                tx, ty = best_target
+                self._aim_at(tx, ty)
+
     def _project_dot(self, center_pos, camera, screen_w, screen_h):
         # The actor's RootComponent relative location is already the capsule center,
         # so project it directly instead of guessing from feet/head.
@@ -901,6 +979,61 @@ class Overlay(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(*color))
         painter.drawEllipse(int(cx - r), int(cy - r), r * 2, r * 2)
+
+    # -----------------------------------------------------------------------
+    # Aimbot helpers
+    # -----------------------------------------------------------------------
+    AIM_KEY_VK = {
+        "MB4": 0x05,
+        "MB5": 0x06,
+        "Shift": 0x10,
+        "Ctrl": 0x11,
+        "Alt": 0x12,
+        "RMB": 0x02,
+        "MMB": 0x04,
+    }
+    MOUSEEVENTF_MOVE = 0x0001
+
+    def _aim_key_held(self):
+        vk = self.AIM_KEY_VK.get(self.config.aimbot_key, 0x06)
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+    def _find_best_target(self, camera, screen_w, screen_h):
+        cx, cy = screen_w / 2, screen_h / 2
+        best_dist = float("inf")
+        best_target = None
+        for is_local, pos, idx in self.esp.iter_players(include_local=False, team_filter=self.config.team_filter):
+            if is_local:
+                continue
+            aim_pos = (pos[0], pos[1], pos[2] + self.config.aimbot_target_offset)
+            s = w2s(aim_pos, camera, screen_w, screen_h)
+            if not s:
+                continue
+            dx = s[0] - cx
+            dy = s[1] - cy
+            d = math.sqrt(dx * dx + dy * dy)
+            if d <= self.config.aimbot_fov and d < best_dist:
+                best_dist = d
+                best_target = s
+        return best_target
+
+    def _get_cursor_pos(self):
+        pt = ctypes.wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return pt.x, pt.y
+        return None
+
+    def _aim_at(self, target_x, target_y):
+        cur = self._get_cursor_pos()
+        if cur is None:
+            return
+        cur_x, cur_y = cur
+        smooth = self.config.aimbot_smooth
+        dx = (target_x - cur_x) * smooth
+        dy = (target_y - cur_y) * smooth
+        if abs(dx) < 1 and abs(dy) < 1:
+            return
+        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
 
 
 # ---------------------------------------------------------------------------
